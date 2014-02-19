@@ -1,0 +1,641 @@
+#!/usr/bin/perl -w
+#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+# Convert a Trac database into github issues format.
+#======================================================================
+# The issues format is a zip of a collection of json encoded files;
+# See https://gist.github.com/izuzak/654612901803d0d0bc3f
+# Inspired by https://github.com/trustmaster/
+#
+# Bruce Miller <bruce.miller@nist.gov>
+# Public domain software, produced as part of work done by the
+# United States Government & not subject to copyright in the US.
+#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+use strict;
+use warnings;
+use DBI qw(:utils);
+use JSON;
+use DateTime;
+use Encode;
+use charnames ':full';
+use Getopt::Long qw(:config no_ignore_case);
+use Pod::Usage;
+use Config::Simple;
+use Text::Wrap qw(wrap);
+
+#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+# Parse command line
+my ($VERBOSITY, $help) = (0, 0);
+my $DESTINATION = undef;
+my $CONFIGFILE  = 'trac2issues.ini';
+GetOptions(
+  "destination=s"   => \$DESTINATION,
+  "configuration=s" => \$CONFIGFILE,
+  "quiet"           => sub { $VERBOSITY--; },
+  "verbose"         => sub { $VERBOSITY++; },
+  "help"            => \$help,
+) or pod2usage(-message => 'trac2issues', -exitval => 1, -verbose => 0, -output => \*STDERR);
+pod2usage(-message => 'trac2issues', -exitval => 1, -verbose => 2, -output => \*STDOUT)
+  if $help;
+
+#======================================================================
+# Get Configuration information, open database, etc.
+
+print "Reading configuration '$CONFIGFILE'...\n" if $VERBOSITY > -1;
+our $CONFIG = Config::Simple->new($CONFIGFILE)
+  or die "Couldn't read configuration file '$CONFIGFILE'";
+
+# Source of the Trac data.
+our $TRACDB = $CONFIG->param('Trac.source') || 'dbi:SQLite:dbname=trac.db';
+our $USER   = $CONFIG->param('Trac.username');
+our $PASS   = $CONFIG->param('Trac.password');
+$USER = undef if ((ref $USER) eq 'ARRAY') && (scalar(@$USER) == 0);    # Odd Config case...
+$PASS = undef if ((ref $PASS) eq 'ARRAY') && (scalar(@$PASS) == 0);    #
+die "No trac source specified!" unless $TRACDB;
+print "Opening Trac database: $TRACDB\n";
+our $DB = DBI->connect($TRACDB, $USER, $PASS);
+our $JSON = JSON->new->allow_nonref->pretty;
+
+binmode(STDOUT, ":encoding(UTF-8)");
+
+#======================================================================
+# Read in all data, and form maps of milestone names, tickets, etc.
+
+my @raw_milestones = read_rows($DB, 'Milestones', "SELECT * FROM milestone ORDER BY due");
+my @raw_tickets    = read_rows($DB, 'Tickets',    "SELECT * FROM ticket ORDER BY id");
+my @raw_comments   = read_rows($DB, 'Comments',   <<'EoQuery');
+  SELECT * FROM ticket_change
+    where field = 'comment'
+     AND newvalue != '' ORDER BY ticket, time
+EoQuery
+
+# extract the simple maps for the renaming of Milestones & Tickets
+my %milestone_map    = ();                                      # milestone_name => milestone_number
+my %ticket_map       = ();                                      # ticket_number => issue_number
+my $milestone_number = $CONFIG->param('Milestones.start') || 1;
+foreach my $row (@raw_milestones) {
+  $milestone_map{ $$row{name} } = $milestone_number++; }
+my $issue_number = $CONFIG->param('Issues.start') || 1;
+foreach my $row (@raw_tickets) {
+  $ticket_map{ $$row{id} } = $issue_number++; }
+
+#======================================================================
+# Convert Milestone objects
+# Raw data:
+#    name : the milestone name
+#    description : descriptive text
+#    due         : date due to be completed
+#    state       : 'closed' if completed
+#    completed   : date completed (if closed)
+
+our @MILESTONES       = ();
+our %milestone_fields = ();
+foreach my $row (@raw_milestones) {
+  print "RAW Milestone: " . $JSON->encode($row) . "\n" if $VERBOSITY > 1;
+  map { $milestone_fields{$_}++ } keys %$row;    # for debugging...
+  my $milestone = {
+    number => $milestone_map{ $$row{name} },
+    state  => ($$row{completed} ? 'closed' : 'open'),
+    title  => translate_title($$row{name}),
+    description => translate_markup($$row{description} || $$row{name}),
+    creator => $CONFIG->param('github.owner'),
+    #   created_at=>'?',
+    ($$row{due} ? (due_on => translate_date($$row{due})) : ()),
+  };
+  push(@MILESTONES, $milestone);
+  print "Milestone: " . $JSON->encode($milestone) . "\n" if $VERBOSITY > 0;
+}
+
+#======================================================================
+# Convert Tickets into Issues
+# Raw data:
+#   id          : the ticket number
+#   summary     : essentially the title
+#   description : descriptive text
+#   reporter    : username that reported it
+#   time        : time ticket was created
+#   changetime  : time ticket was last changed
+#   owner       : username assigned to ticket
+#   status      : 'closed' if closed
+#   type        : type of problem, keyword
+#   resolution  : a keyword how dealt with
+#   version     : software version keyword
+#   component   : a compoment keyword
+#   priority    : priority keyword
+#   severity    : severity keyword
+#   keywords    : list of keywords
+#   cc          : additional email addresses to notify
+our @ISSUES = ();
+# Categorized Labels
+# $CATLABELS{category}{keyword} = number of usages.
+our %CATLABELS      = ();
+our %TRACUSERS      = ();
+our %UNMAPPED_USERS = ();
+our %ticket_fields  = ();
+
+foreach my $row (@raw_tickets) {
+  print "Raw Issue: " . $JSON->encode($row) . "\n" if $VERBOSITY > 1;
+  map { $ticket_fields{$_}++ } keys %$row;
+  my $issue = {
+    number => $ticket_map{ $$row{id} },
+    title  => translate_title($$row{summary}),
+    body   => "[Originally Ticket $$row{id}"
+      . ($$row{reporter} && !check_user($$row{reporter})
+      ? ", reported by $$row{reporter}" : "") . "]\n\n"
+      . translate_markup($$row{description}),
+    ($$row{time}       ? (created_at => translate_date($$row{time}))       : ()),
+    ($$row{changetime} ? (updated_at => translate_date($$row{changetime})) : ()),
+    (($$row{status} eq 'closed') && $$row{changetime}
+      ? (closed_at => translate_date($$row{changetime})) : ()),
+    # user must be given, I think
+    user => translate_user($$row{reporter}),
+    # note: assignee needn't be defined,
+    # BUT needs to be an owner or collaborator of the project, I think.
+    assignee => translate_user($$row{owner}),
+    ($$row{milestone} ? (milestone => $milestone_map{ $$row{milestone} }) : ()),
+    labels => extract_labels($row),
+    state => ($$row{status} eq 'closed' ? 'closed' : 'open'),
+  };
+  print "Issue: " . $JSON->encode($issue) . "\n" if $VERBOSITY > 0;
+  push(@ISSUES, $issue); }
+
+#======================================================================
+# Comments; associated with Tickets/Issues
+# NOTE that we're only selecting a subset (field='comment') of the ticket_change table!
+# I assume there are other entries covering attachments and such!
+#   field    : 'comment'
+#   ticket   : id of ticket this affects
+#   author   : user that made the comment
+#   time     : time the comment was made
+#   oldvalue : Either a number (the comment number)
+#       or dotted pair of numbers (comment $2 in reply to comment $1)
+#   newvalue : For comments, this is the comment text.
+
+our %COMMENTS       = ();
+our %comment_fields = ();
+foreach my $row (@raw_comments) {
+  map { $comment_fields{$_}++ } keys %$row;
+  next unless ($$row{field} || '') eq 'comment';
+  print "Raw Comment: " . $JSON->encode($row) . "\n" if $VERBOSITY > 1;
+  my $comment = {
+    user => translate_user($$row{author}),
+    body => ($$row{author} && !check_user($$row{author})
+      ? "[Original comment by $$row{author}]\n\n" : "")
+      . translate_markup($$row{newvalue}),
+    ($$row{time}       ? (created_at => translate_date($$row{time}))       : ()),
+    ($$row{changetime} ? (updated_at => translate_date($$row{changetime})) : ()),
+  };
+  print "Comment: " . $JSON->encode($comment) . "\n" if $VERBOSITY > 0;
+  push(@{ $COMMENTS{ $ticket_map{ $$row{ticket} } } }, $comment);
+}
+
+#======================================================================
+# Analysis phase (if not yet writing out)
+# Summarize proposed labels; List the usernames we've seen.
+# Use this to fine-tune the configuration.
+if ((!$DESTINATION) && ($VERBOSITY > -1)) {
+  print "\nTrac data summary\n";
+
+  print wrap("  Trac users with no github name: ", '      ',
+    join(', ', sort keys %UNMAPPED_USERS)) . "\n";
+
+  print "\n  Trac fields & values to be used for labels:\n";
+  my %labels = ();
+  foreach my $field (sort keys %CATLABELS) {
+    print wrap("    $field : ", '       ',
+      join(', ', map { "$_($CATLABELS{$field}{$_})" }
+          sort keys %{ $CATLABELS{$field} }))
+      . "\n";
+    # form inverted list
+    foreach my $label (sort keys %{ $CATLABELS{$field} }) {
+      $labels{$label}{$field} = 1; } }
+  # Check for values in fields that will yeild the same label
+  # (in case that's a problem)
+  my @clashes = ();
+  foreach my $label (sort keys %labels) {
+    if (scalar(keys %{ $labels{$label} }) > 1) {
+      push(@clashes, $label . '(' . join(',', sort keys %{ $labels{$label} }) . ')'); } }
+  print wrap('  Duplicate values from different fields: ', '       ',
+    join(', ', @clashes)) . "\n" if @clashes;
+
+  print wrap('  Proposed labels: ', '       ', join(', ', sort keys %labels)) . "\n"
+}
+
+if (0) {    # For debugging, to check if I'm overlooking data
+  print "Trac database fields seen:\n";
+  print wrap('  Milestones: ', '       ', join(', ', sort keys %milestone_fields)) . "\n";
+  print wrap('  Tickets   : ', '       ', join(', ', sort keys %ticket_fields)) . "\n";
+  print wrap('  Comments  : ', '       ', join(', ', sort keys %comment_fields)) . "\n";
+}
+#======================================================================
+# Finally, start writing the stuff.
+#
+# The target format is a zip or tarball containing the structure:
+#  issues/
+#    1.json
+#    1.comments.json
+#    2.json
+#    2.comments.json
+#    ...
+#  milestones/
+#    1.json
+#    2.json
+#    ...
+
+if ($DESTINATION) {
+  print "Writing Milestone/Issues data to '$DESTINATION'\n" if $VERBOSITY > -1;
+  if (!-d $DESTINATION) {
+    mkdir($DESTINATION) or die "Couldn't create issues directory '$DESTINATION': $!";
+    print "Created directory '$DESTINATION'\n" if $VERBOSITY > -1; }
+  if (!-d "$DESTINATION/milestones") {
+    mkdir("$DESTINATION/milestones") or die "Couldn't create milestones subdirectory: $!"; }
+  if (!-d "$DESTINATION/issues") {
+    mkdir("$DESTINATION/issues") or die "Couldn't create issues subdirectory: $!"; }
+  my ($nm, $ni, $nc) = (0, 0, 0);
+  foreach my $milestone (@MILESTONES) {
+    write_row('milestones/' . $$milestone{number}, $milestone);
+    $nm++; }
+  foreach my $issue (@ISSUES) {
+    write_row('issues/' . $$issue{number}, $issue);
+    $ni++;
+    if (my $comments = $COMMENTS{ $$issue{number} }) {
+      write_row('issues/' . $$issue{number} . '.comments', $comments);
+      $nc++; } }
+  print "Wrote $nm milestone, $ni issue and $nc comment files\n" if $VERBOSITY > -1;
+}
+
+#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+# Helpers....
+
+#======================================================================
+# Reading & Writing the data rows
+
+# Read all the rows for a database query,
+# normalizing the content (unicode, line endings, whatever)
+sub read_rows {
+  my ($db, $group, $sqlquery) = @_;
+  my $raw_rows = $db->selectall_arrayref($sqlquery, { Slice => {} });
+  print "Read " . scalar(@$raw_rows) . " rows for $group\n" if $VERBOSITY > -1;
+  my @rows;
+  my $n = 1;
+  foreach my $row (@$raw_rows) {
+    my $newrow = {};
+    foreach my $field (keys %$row) {
+      my $value = $$row{$field};
+      next unless defined $value;
+      my $newvalue = normalize_string($value);
+      #      if(classify_codes("$group row $n: $field",$newvalue)){
+      #      }
+      $$newrow{$field} = $newvalue; }
+    push(@rows, $newrow); $n++; }
+  return @rows; }
+
+sub normalize_string {
+  my ($string) = @_;
+  # BIZARRE: You have to assign to DIFFERENT variable, else never see the change!?!?!
+  my $encoding = $CONFIG->param('Trac.encoding');
+  my $newstring = ($encoding ? decode($encoding, $string) : $string);
+  $newstring =~ s/(?:\015\012|\015|\012)/\n/sg;    # normalize CRLF, etc (needed ?)
+      # It _seems_ that it is really only plane 1 unicode that messes up Github's import(?)
+  $newstring = plane1_patchup($newstring);
+  return $newstring; }
+
+sub plane1_patchup {
+  my ($string) = @_;
+  my %plane1 = ();
+  foreach my $char (split('', $string)) {
+    my $code = ord($char);
+    if ($code > 0xFFFF) {
+      $plane1{$char} = sprintf('U+%00000x', $code); } }
+  if (my $re = join('|', keys %plane1)) {
+    print "Replacing plane-1 unicode: "
+      . join(',', map { "$_=>$plane1{$_}" } sort keys %plane1) . "\n";
+    $string =~ s/($re)/ $plane1{$1} /ge; }
+  return $string; }
+
+# test code....
+sub classify_codes {
+  my ($entry, $string) = @_;
+  my %iso    = ();
+  my %uni    = ();
+  my %plane1 = ();
+  foreach my $char (split('', $string)) {
+    my $code = ord($char);
+    if ($code < 0x80) { }
+    elsif ($code <= 0xFF) {
+      my $uchar = decode('iso-8859-1', $char);
+      $iso{$code}++; }
+    elsif ($code <= 0xFFFF) {
+      $uni{$char}++; }
+    else {
+      $plane1{$char}++; } }
+  my $result = undef;
+  if (keys %iso) {
+    $result = 1;
+    #    print "Entry $entry has non-unicode: ".
+    #      join(',',map { sprintf('%00x',$_).'('.charnames::viacode($_).')' } sort keys %iso)."\n";
+  }
+  if (keys %uni) {
+    #    print "Entry $entry has unicode: ".join(',',sort keys %uni)."\n";
+  }
+  # Apparently it is only plane1 that is causing troubles
+  if (keys %plane1) {
+    print "Entry $entry has plane-1: " . join(',', sort keys %plane1) . "\n";
+    #    print "Value is '$string'\n";
+  }
+  return $result;
+}
+
+sub write_row {
+  my ($name, $object) = @_;
+  my $FH;
+  open($FH, '>:encoding(UTF-8)', "$DESTINATION/$name.json")
+    or die "Couldn't open file '$DESTINATION/$name.json': $!";
+  print $FH $JSON->encode($object) . "\n";
+  close($FH);
+  return; }
+
+#======================================================================
+# Tools to translate various kinds of data.
+
+sub translate_title {
+  my ($title) = @_;
+  # Quote: "There is a strange issue with summaries containing percent signs..."
+  $title =~ s/%/\[pct\]/g;
+  # Is there other markup here that should be translated?
+  return $title; }
+
+# Should format as ISO, presumably GMT/UTC
+# Trac dates are apparently in microseconds from Unix epoch,
+# and in the timezone of whereever the system is..... ?
+sub translate_date {
+  my ($date) = @_;
+  return DateTime->from_epoch(
+    epoch     => int($date / 1000000),
+    time_zone => $CONFIG->param('Trac.timezone'))->datetime() . "Z"; }
+
+sub check_user {
+  my ($tracuser) = @_;
+  my $gituser = $tracuser && $CONFIG->param('Users.' . $tracuser);
+  $gituser = undef if $gituser && (ref $gituser eq 'ARRAY') && (scalar(@$gituser) == 0);
+  return ($gituser ? $gituser : undef); }
+
+sub translate_user {
+  my ($tracuser) = @_;
+  my $gituser = check_user($tracuser);
+  # Note the users we've seen for later analysis
+  $TRACUSERS{$tracuser}++;
+  $UNMAPPED_USERS{$tracuser}++ unless defined $gituser;
+  # alas, it has to be, at least, the owner
+  return ($gituser || $CONFIG->param('github.owner')); }
+
+sub extract_labels {
+  my ($row) = @_;
+  my %labels = ();
+  # translate various fields into labels
+  foreach my $labeltype (@{ $CONFIG->param('Label.field') }) {
+    my $value = $$row{$labeltype};
+    next unless $value;
+    my @values = (($CONFIG->param('Label.' . $labeltype . '.split') || 'false') eq 'true'
+      ? split(/(?:,\s*|\s+)/, $value)
+      : ($value));
+    foreach my $word (@values) {
+      if (my $translated = translate_label($labeltype, $word)) {
+
+        $labels{$translated} = 1;
+        $CATLABELS{$labeltype}{$translated}++;    # Store for later analysis
+      } } }
+  return [sort keys %labels]; }
+
+sub translate_label {
+  my ($category, $label) = @_;
+  return unless $label;
+  # Lookup replacement for label as
+  #    LabelMap.$category.$label for specific keyword in category
+  # or
+  #    LabelMap.$category for all (other) entries in category
+  # Note that config entry like
+  #      category.keyword =
+  # generates an ARRAY ref to an empty array! implying empty replacement;
+  # which throws away such labels
+  if (my $replacement = $CONFIG->param('LabelMap.' . $category . '.' . $label)
+    || $CONFIG->param('LabelMap.' . $category)) {
+    $replacement = undef if (ref $replacement) && (scalar(@$replacement) == 0);
+    return $replacement; }
+  return $label; }
+
+sub translate_markup {
+  my ($text) = @_;
+
+  # Code blocks get treated essentially as verbatim;
+  # a number of substitutions do not apply.
+
+  my @blocks = ();
+  # Trac code blocks are essentially: {{{ code block }}}
+  # They can be displayed blocks (preceeded & followed by newlines), or inline.
+  # BUT, there're LOTS of stray {{{ and }}} in discussions of Perl and TeX!!!
+  # Particularly in the displayed blocks!! Use that for leverage!
+  # Of course, people don't use Markdown correctly!
+
+  # Try in steps: pull out displayed blocks first!
+  $text =~ s/(^\s*|\n>*\s*)
+             \{\{\{
+             (?:\s*\#!(\w+))?
+             (\s*\n.*?\n>*\s*)
+             \}\}\}
+             (\s*\n|\s*$)/
+    push(@blocks,$1.'```'.($2||'').$3.'```'.$4); '###CODEBLOCK'.scalar(@blocks).'###'/xsge;
+  # Now, try to pull any inline code blocks, W/O nested {{{ !
+  $text =~ s/(?<!\{)
+             \{\{\{
+             (?:\s*\#!(\w+))?((?:[^\{]|\{(?!\{\{))+?)
+             \}\}\}
+             (?!\})/
+    push(@blocks,'```'.($1||'').$2.'```'); '###CODEBLOCK'.scalar(@blocks).'###'/xmsge;
+  # Now, try again for not quite so displayed, but w/o extra newlines
+  $text =~ s/(^\s*|\n>*\s*)
+             \{\{\{
+             (?:\s*\#!(\w+))?
+             (.*?)
+             \}\}\}
+             (\s*\n|\s*$)/
+     push(@blocks,$1.'```'.($2||'').$3.'```'.$4); '###CODEBLOCK'.scalar(@blocks).'###'/xsge;
+
+  # Now, make substitutions that should not go in the code blocks
+
+  # New lines are treated literally in github markdown,
+  # but often ignored in Trac, unless followed by a variety of markup (bullets, bars...?)
+  # Trac's preserved \n can be thrown out, then, Trac's [BR] turned into \n!
+  # Alas, there are so many special case, just leave the Trac \n in!!!
+  ## $text =~ s/(\n\n+)/'###BREAK'.length($1).'###'/gse; # Hold multiple \n
+  ## $text =~ s/\n(?=[a-zA-Z])/ /gs; # toss new lines if followed by a letter
+  $text =~ s/\[\[BR\]\]\n/\n/gs;    # [BR] goes to "hard" newline.
+  ## $text =~ s/###BREAK(\d+)###/ "\n"x$1 /ge;
+
+  # Quote: "non-ASCII characters, as that will cause trouble with json_encode()"
+  # Whu !?!?!?!
+  # Actually, plane 1 characters DO mess up the upload at somepoint....
+
+  # Various kinds of TracLinks to Markdown
+  # This is the original regexp; horribly wrong....
+  #  $text =~ s/\[([^ ]+) ([^\]]+)\]/[$2]($1)/gm; # ?????
+  $text =~ s/(?<!\!)#(\d+)/ '#'.($ticket_map{$1}||$1) /ge;
+  $text =~ s/\[ticket:(\d+)(?:(?:\||\s+)([^\]]*))?\]/
+    '#'.$ticket_map{$1}.($2 ? (check_user($2) ? ' @'.check_user($2) : ' by '.$2) : '') /ge;
+  $text =~ s/\[(https?:\S+)\s+([^\]]*)\]/[$2]($1)/g;
+  $text =~ s/\[comment:(\d+)(?:\s+([^\]]*))?\]/
+    "comment $1".($2 ? (check_user($2) ? ' @'.check_user($2) : ' by '.$2) : '')/eg;
+  $text =~ s/ticket:(\d+)(#comment:\d+)?/ '#'.$ticket_map{$1} /ge;
+  $text =~ s/\@(\w+)/ '@'.(check_user($1)||$1) /ge;
+  $text =~ s/\[\[Image\(([^\)]+)\)\]\]/![$1]($1)/g;
+
+  # I'd try to translate some of the lower-level styling markup,
+  # but the noise characters are so heavily overloaded, and used alone anyway...
+  # Just translate the simplest phrases inside!
+  $text =~ s/'''([\w\s]+)'''/**$1**/g;    # bold
+  $text =~ s/''([\w\s]+)''/*$1*/g;        # italic
+  $text =~ s/\/\/([\w\s]+)\/\//*$1*/g;    # italic
+
+  # headings
+  $text =~ s/^(==+)\s/ ('#'x length($1)).' ' /gem;
+  $text =~ s/(:?==+)\s*$//gm;
+
+  # Finally, we can put the code blocks back in now
+  $text =~ s/###CODEBLOCK(\d+)###/ $blocks[$1-1] /ge;
+
+  return $text; }
+
+#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+__END__
+
+=head1 NAME
+
+C<trac2issues> - converts a Trac database to an Issues file
+
+=head1 SYNOPSIS
+
+trac2issues [options]
+
+Converts the Milestones, Tickets and Comments from a Trac database
+into a format that can be uploaded to github.com repository as a collection of Issues.
+It preserves, usernames, creation dates and formatting, to the extent possible,
+but does I<not>, currently, preserve attachments.
+The conversion is controlled by parameters in the configuration file,
+and which are documented there; the default configuration file is C<trac2issues.ini>.
+
+The Trac database can be a local SQLite file (trac.db);
+but since DBI is used, it may work with other ways of accessing the SQL database.
+See the configuration file for how to specify the database.
+
+Until you specify a destination (see L<Output>) for the data, C<trac2issues> simply
+scans the data and reports on proposed labels and unrecognized user names.
+You typically will want to fine-tune the mappings of several Trac data fields
+into the list of github labels to use (see L<Labels>). You also will want to list the
+associated github user name for each Trac user who originally reported
+or commented in the Trac so as to generate a more sensible conversation on github
+(see <Users>).
+
+Options:
+
+  --destination=dir     Indicates where to write the tree of
+                        Issues and Milestone files.
+                        [default just reports on data]
+  --configuration=file  specifies configuration file
+                        [default is trac2issues.ini]
+  --verbose             output more info
+  --quiet               output less info
+  --help                shows this message.
+
+=head2 Labels
+
+Note that Trac provides for several fields that are used to characterize tickets
+(such as C<type>, C<component>, C<priority>, C<resolution>, C<severity>, C<version>, C<keywords>),
+whereas github Issues provides a single, extensible, set of C<labels>
+(in addition to Milestones).
+Exactly how you would want the Trac fields mapped into Issues labels depends
+on the set of terms that have been used, how much of that detail you wish to preserve;
+not to mention personal taste.
+
+You can control this mapping by adding entries into the C<[LabelMap]> block
+in the configuration file. As an example, suppose the original Trac database
+has a field called C<component>. You can arrange to have all Tickets involving
+the component C<doc> to be converted into Issues with the Label C<documentation>
+by specifying:
+
+   component.doc = documentation
+
+You can ignore the component C<general> by specifying:
+
+   component.general =
+
+Note that the Ticket is still converted to an Issue, but has no extra label.
+Likewise, you might specify
+
+  keywords.bibliography = bibliography
+  keywords.installation = installation
+  keywords =
+
+to specify that the two keywords C<bibliography> and C<installation> would
+be preserved, and that all other other values would be ignored.
+
+It seems that the default labels for new repository at github are:
+C<bug>, C<duplicate>, C<enhancement>, C<invalid>, C<question>, C<wontfix>.
+It might make sense to map some of the keywords previously used in Trac
+to those terms.
+
+=head2 Users
+
+Often folks will not necessarily use the same user name on github
+as they had on Trac, so you will want to indicate the mapping in the
+C<[Users]> block of the configuration file.  You simply specify for each
+Trac user
+
+    tracusername = gitusername
+
+Issues and comments from users with no github name
+(or whose github name is misspelled!) will get attributed
+to the git repository owner.
+Having a complete mapping helps assure that conversations
+make sense, and avoid the appearance of you having a
+raging debate with yourself.
+
+=head2 Output
+
+The Milestones, and Issues are numbered and printed in JSON format
+(as described at https://gist.github.com/izuzak/654612901803d0d0bc3f)
+into files in the destination directory as:
+
+   destination
+    |--milestones
+         |-- 1.json
+         |-- ...
+    |--issues
+         |-- 1.json
+         |-- 1.comments.json
+         |-- ...
+
+You can specify the starting milestone or issue number in the configuration
+file, if the data will be appended to an existing Issues list.
+This directory should be zipped and sent to someone at github.com.
+Send them an email and ask!
+
+=head2 Limitations
+
+The markup isn't always faithfully transformed.
+There is (at the time of writing) no support for attachments in Issues, so these are not copied.
+Issue Assignees on github must (apparently) be an owner or collaborator of the repository
+being written to, others will be dropped when the issue is imported.
+
+=head1 AUTHOR
+
+Bruce Miller <bruce.miller@nist.gov>
+
+=head1 COPYRIGHT
+
+Public domain software, produced as part of work done by the
+United States Government & not subject to copyright in the US.
+
+=cut
+
+
+
