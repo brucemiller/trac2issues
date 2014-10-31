@@ -54,6 +54,7 @@ die "No trac source specified!" unless $TRACDB;
 print "Opening Trac database: $TRACDB\n";
 our $DB = DBI->connect($TRACDB, $USER, $PASS);
 our $JSON = JSON->new->allow_nonref->pretty;
+$JSON->canonical(1);
 
 binmode(STDOUT, ":encoding(UTF-8)");
 
